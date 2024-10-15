@@ -170,12 +170,32 @@ mod struct_array;
 mod tape;
 mod timestamp_array;
 
+/// Specifies what is considered valie JSON when parsing StructArrays.
+///
+/// If a struct with fields `("a", Int32)` and `("b", Utf8)`, it could be represented as
+/// a JSON object (`{"a": 1, "b": "c"}`) or a JSON list (`[1, "c"]`).  This enum controls
+/// which form(s) the Reader will accept.
+///
+/// For objects, the order of the key does not matter. (??? Extra keys?)
+/// For lists, the entries must be the same number and in the same order as the struct fields.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum StructParseMode {
+    #[default]
+    /// Only parse objects (e.g., {"a": 1, "b": "c"})
+    ObjectOnly,
+    /// Only parse lists (e.g., [1, "c"])
+    ListOnly,
+    /// Parse either objects (e.g., {"a": 1, "b": "c"}) or lists (e.g., [1, "c"])
+    Mixed,
+}
+
 /// A builder for [`Reader`] and [`Decoder`]
 pub struct ReaderBuilder {
     batch_size: usize,
     coerce_primitive: bool,
     strict_mode: bool,
     is_field: bool,
+    struct_mode: StructParseMode,
 
     schema: SchemaRef,
 }
@@ -195,6 +215,7 @@ impl ReaderBuilder {
             coerce_primitive: false,
             strict_mode: false,
             is_field: false,
+            struct_mode: StructParseMode::ObjectOnly,
             schema,
         }
     }
@@ -235,6 +256,7 @@ impl ReaderBuilder {
             coerce_primitive: false,
             strict_mode: false,
             is_field: true,
+            struct_mode: StructParseMode::ObjectOnly,
             schema: Arc::new(Schema::new([field.into()])),
         }
     }
@@ -269,6 +291,15 @@ impl ReaderBuilder {
         }
     }
 
+    /// Set the [`StructParseMode`] for the reader, which determines whether
+    /// structs can be represented by JSON objects, lists, or either.
+    pub fn with_struct_parse_mode(self, struct_mode: StructParseMode) -> Self {
+        Self {
+            struct_mode,
+            ..self
+        }
+    }
+
     /// Create a [`Reader`] with the provided [`BufRead`]
     pub fn build<R: BufRead>(self, reader: R) -> Result<Reader<R>, ArrowError> {
         Ok(Reader {
@@ -287,7 +318,13 @@ impl ReaderBuilder {
             }
         };
 
-        let decoder = make_decoder(data_type, self.coerce_primitive, self.strict_mode, nullable)?;
+        let decoder = make_decoder(
+            data_type,
+            self.coerce_primitive,
+            self.strict_mode,
+            nullable,
+            self.struct_mode,
+        )?;
 
         let num_fields = self.schema.flattened_fields().len();
 
@@ -650,6 +687,7 @@ fn make_decoder(
     coerce_primitive: bool,
     strict_mode: bool,
     is_nullable: bool,
+    struct_mode: StructParseMode,
 ) -> Result<Box<dyn ArrayDecoder>, ArrowError> {
     downcast_integer! {
         data_type => (primitive_decoder, data_type),
@@ -696,13 +734,13 @@ fn make_decoder(
         DataType::Boolean => Ok(Box::<BooleanArrayDecoder>::default()),
         DataType::Utf8 => Ok(Box::new(StringArrayDecoder::<i32>::new(coerce_primitive))),
         DataType::LargeUtf8 => Ok(Box::new(StringArrayDecoder::<i64>::new(coerce_primitive))),
-        DataType::List(_) => Ok(Box::new(ListArrayDecoder::<i32>::new(data_type, coerce_primitive, strict_mode, is_nullable)?)),
-        DataType::LargeList(_) => Ok(Box::new(ListArrayDecoder::<i64>::new(data_type, coerce_primitive, strict_mode, is_nullable)?)),
-        DataType::Struct(_) => Ok(Box::new(StructArrayDecoder::new(data_type, coerce_primitive, strict_mode, is_nullable)?)),
+        DataType::List(_) => Ok(Box::new(ListArrayDecoder::<i32>::new(data_type, coerce_primitive, strict_mode, is_nullable, struct_mode)?)),
+        DataType::LargeList(_) => Ok(Box::new(ListArrayDecoder::<i64>::new(data_type, coerce_primitive, strict_mode, is_nullable, struct_mode)?)),
+        DataType::Struct(_) => Ok(Box::new(StructArrayDecoder::new(data_type, coerce_primitive, strict_mode, is_nullable, struct_mode)?)),
         DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
             Err(ArrowError::JsonError(format!("{data_type} is not supported by JSON")))
         }
-        DataType::Map(_, _) => Ok(Box::new(MapArrayDecoder::new(data_type, coerce_primitive, strict_mode, is_nullable)?)),
+        DataType::Map(_, _) => Ok(Box::new(MapArrayDecoder::new(data_type, coerce_primitive, strict_mode, is_nullable, struct_mode)?)),
         d => Err(ArrowError::NotYetImplemented(format!("Support for {d} in JSON reader")))
     }
 }
@@ -718,7 +756,7 @@ mod tests {
     use arrow_buffer::{ArrowNativeType, Buffer};
     use arrow_cast::display::{ArrayFormatter, FormatOptions};
     use arrow_data::ArrayDataBuilder;
-    use arrow_schema::Field;
+    use arrow_schema::{Field, Fields};
 
     use super::*;
 
@@ -2314,6 +2352,81 @@ mod tests {
                 ]
             )
             .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_struct_encoding() {
+        use arrow_array::builder;
+
+        let nested_object_json = r#"{"a": {"b": [1, 2], "c": {"d": 3}}}"#;
+        let nested_list_json = r#"[[[1, 2], {"d": 3}]]"#;
+        let nested_mixed_json = r#"{"a": [[1, 2], {"d": 3}]}"#;
+
+        let struct_fields = Fields::from(vec![
+            Field::new("b", DataType::new_list(DataType::Int32, true), true),
+            Field::new_map(
+                "c",
+                "entries",
+                Field::new("keys", DataType::Utf8, false),
+                Field::new("values", DataType::Int32, true),
+                false,
+                false,
+            ),
+        ]);
+
+        let list_array =
+            ListArray::from_iter_primitive::<Int32Type, _, _>(vec![Some(vec![Some(1), Some(2)])]);
+
+        let map_array = {
+            let mut map_builder = builder::MapBuilder::new(
+                None,
+                builder::StringBuilder::new(),
+                builder::Int32Builder::new(),
+            );
+            map_builder.keys().append_value("d");
+            map_builder.values().append_value(3);
+            map_builder.append(true).unwrap();
+            map_builder.finish()
+        };
+
+        let struct_array = StructArray::new(
+            struct_fields.clone(),
+            vec![Arc::new(list_array), Arc::new(map_array)],
+            None,
+        );
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            DataType::Struct(struct_fields),
+            true,
+        )]));
+        let expected = RecordBatch::try_new(schema.clone(), vec![Arc::new(struct_array)]).unwrap();
+
+        let parse = |s: &str, mode: StructParseMode| {
+            ReaderBuilder::new(schema.clone())
+                .with_struct_parse_mode(mode)
+                .build(Cursor::new(s.as_bytes()))
+                .unwrap()
+                .next()
+                .unwrap()
+        };
+
+        assert_eq!(
+            parse(nested_object_json, StructParseMode::ObjectOnly).unwrap(),
+            expected
+        );
+        assert_eq!(
+            parse(nested_list_json, StructParseMode::ObjectOnly)
+                .unwrap_err()
+                .to_string(),
+            "".to_owned()
+        );
+        assert_eq!(
+            parse(nested_mixed_json, StructParseMode::ObjectOnly)
+                .unwrap_err()
+                .to_string(),
+            "".to_owned()
         );
     }
 }

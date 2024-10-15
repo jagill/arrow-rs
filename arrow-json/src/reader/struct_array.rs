@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::reader::tape::{Tape, TapeElement};
-use crate::reader::{make_decoder, ArrayDecoder};
+use crate::reader::{make_decoder, ArrayDecoder, StructParseMode};
 use arrow_array::builder::BooleanBufferBuilder;
 use arrow_buffer::buffer::NullBuffer;
 use arrow_data::{ArrayData, ArrayDataBuilder};
@@ -27,6 +27,7 @@ pub struct StructArrayDecoder {
     decoders: Vec<Box<dyn ArrayDecoder>>,
     strict_mode: bool,
     is_nullable: bool,
+    struct_mode: StructParseMode,
 }
 
 impl StructArrayDecoder {
@@ -35,6 +36,7 @@ impl StructArrayDecoder {
         coerce_primitive: bool,
         strict_mode: bool,
         is_nullable: bool,
+        struct_mode: StructParseMode,
     ) -> Result<Self, ArrowError> {
         let decoders = struct_fields(&data_type)
             .iter()
@@ -48,6 +50,7 @@ impl StructArrayDecoder {
                     coerce_primitive,
                     strict_mode,
                     nullable,
+                    struct_mode,
                 )
             })
             .collect::<Result<Vec<_>, ArrowError>>()?;
@@ -57,6 +60,7 @@ impl StructArrayDecoder {
             decoders,
             strict_mode,
             is_nullable,
+            struct_mode,
         })
     }
 }
@@ -71,11 +75,16 @@ impl ArrayDecoder for StructArrayDecoder {
             .then(|| BooleanBufferBuilder::new(pos.len()));
 
         for (row, p) in pos.iter().enumerate() {
-            let end_idx = match (tape.get(*p), nulls.as_mut()) {
-                (TapeElement::StartObject(end_idx), None) => end_idx,
+            let (end_idx, is_list) = match (tape.get(*p), nulls.as_mut()) {
+                (TapeElement::StartObject(end_idx), None) => (end_idx, false),
                 (TapeElement::StartObject(end_idx), Some(nulls)) => {
                     nulls.append(true);
-                    end_idx
+                    (end_idx, false)
+                }
+                (TapeElement::StartList(end_idx), None) => (end_idx, true),
+                (TapeElement::StartList(end_idx), Some(nulls)) => {
+                    nulls.append(true);
+                    (end_idx, true)
                 }
                 (TapeElement::Null, Some(nulls)) => {
                     nulls.append(false);
@@ -83,6 +92,22 @@ impl ArrayDecoder for StructArrayDecoder {
                 }
                 _ => return Err(tape.error(*p, "{")),
             };
+
+            match (is_list, self.struct_mode) {
+                (false, StructParseMode::ListOnly) => {
+                    return Err(ArrowError::JsonError(format!(
+                        "in struct_mode {:?}, StructArrays require JSON lists, not objects",
+                        self.struct_mode
+                    )))
+                }
+                (true, StructParseMode::ObjectOnly) => {
+                    return Err(ArrowError::JsonError(format!(
+                        "in struct_mode {:?}, StructArrays require JSON objects, not lists",
+                        self.struct_mode
+                    )))
+                }
+                _ => (),
+            }
 
             let mut cur_idx = *p + 1;
             while cur_idx < end_idx {
